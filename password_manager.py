@@ -1,90 +1,120 @@
 # -*- coding: utf-8 -*-
 """
-Менеджер паролей v3
-Русский интерфейс, логистическая генерация паролей,
-вход по мастер-паролю с хранением хеша в config.json.
+Менеджер паролей v4
+1) Русский интерфейс
+2) Мастер-пароль (можно менять)
+3) Шифрование всей базы через Fernet
 Требования:
     pip install PySide6 SQLAlchemy cryptography
 """
 
-import sys
-import os
-import time
-import json
-import base64
-import hmac
-import hashlib
-
+import sys, os, json, base64, hmac, time, string
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTableWidget, QTableWidgetItem,
     QPushButton, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
-    QLabel, QDialog, QMessageBox, QInputDialog
+    QLabel, QDialog, QMessageBox, QInputDialog, QMenuBar
 )
+# ACTION надо импортировать из QtGui, а не из QtWidgets
+from PySide6.QtGui     import QAction
+
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import declarative_base, sessionmaker
+
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
+from cryptography.fernet import Fernet
 
 # --- Константы и пути ---
-CONFIG     = 'config.json'
-DB_FILE    = 'passwords.db'
-ITERATIONS = 200_000
+CONFIG_FILE    = 'config.json'
+ENCRYPTED_DB   = 'passwords.enc'
+PLAIN_DB       = 'passwords.db'
+ITERATIONS     = 200_000
 
-
-# --- Работа с конфигом (мастер-пароль) ---
-def hash_password(password: str, salt: bytes) -> bytes:
-    """Выдает 32-байтовый хеш пароля по PBKDF2-HMAC-SHA256."""
+# --- Mастер-пароль + Fernet-ключ ---
+def derive_key(password: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=ITERATIONS,
+        algorithm=hashes.SHA256(), length=32,
+        salt=salt, iterations=ITERATIONS
     )
-    return kdf.derive(password.encode())
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
 def init_config():
-    """Если нет config.json — спрашиваем новый мастер-пароль и сохраняем хеш+соль."""
-    if not os.path.exists(CONFIG):
+    if not os.path.exists(CONFIG_FILE):
         pw, ok = QInputDialog.getText(
-            None, 'Установка пароля',
-            'Придумайте мастер-пароль:',
-            QLineEdit.Password
+            None, 'Установка мастер-пароля',
+            'Придумайте мастер-пароль:', QLineEdit.Password
         )
         if not ok or not pw:
             sys.exit()
-        salt     = os.urandom(16)
-        pwd_hash = hash_password(pw, salt)
-        with open(CONFIG, 'w', encoding='utf-8') as f:
+        salt = os.urandom(16)
+        key  = derive_key(pw, salt)
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump({
                 'salt': base64.b64encode(salt).decode(),
-                'hash': base64.b64encode(pwd_hash).decode()
+                'hash': base64.b64encode(key).decode()
             }, f, indent=2)
 
-def check_master_password():
-    """Проверяем введенный пароль по хешу из config.json."""
+def check_master_password() -> bytes:
     try:
-        with open(CONFIG, 'r', encoding='utf-8') as f:
-            cfg = json.load(f)
+        cfg    = json.load(open(CONFIG_FILE,'r',encoding='utf-8'))
+        salt   = base64.b64decode(cfg['salt'])
+        stored = base64.b64decode(cfg['hash'])
     except Exception:
         QMessageBox.critical(None, 'Ошибка', 'Не удалось прочитать config.json.')
         sys.exit()
-    salt   = base64.b64decode(cfg.get('salt',''))
-    stored = base64.b64decode(cfg.get('hash',''))
 
     pw, ok = QInputDialog.getText(
         None, 'Авторизация',
-        'Введите мастер-пароль:',
-        QLineEdit.Password
+        'Введите мастер-пароль:', QLineEdit.Password
     )
     if not ok:
         sys.exit()
-    candidate = hash_password(pw, salt)
-    if not hmac.compare_digest(candidate, stored):
-        QMessageBox.critical(None, 'Ошибка', 'Неверный пароль.')
+    key = derive_key(pw, salt)
+    if not hmac.compare_digest(key, stored):
+        QMessageBox.critical(None, 'Ошибка', 'Неверный мастер-пароль.')
         sys.exit()
+    return key
 
+def change_master_password(old_key: bytes):
+    new_pw, ok = QInputDialog.getText(
+        None, 'Смена мастер-пароля',
+        'Введите новый мастер-пароль:', QLineEdit.Password
+    )
+    if not ok or not new_pw:
+        return
+    new_salt = os.urandom(16)
+    new_key  = derive_key(new_pw, new_salt)
 
-# --- Модель базы данных ---
+    # перешифровываем базу
+    f_old = Fernet(old_key)
+    data  = f_old.decrypt(open(ENCRYPTED_DB,'rb').read())
+    f_new = Fernet(new_key)
+    open(ENCRYPTED_DB,'wb').write(f_new.encrypt(data))
+
+    # обновляем config.json
+    with open(CONFIG_FILE,'w',encoding='utf-8') as f:
+        json.dump({
+            'salt': base64.b64encode(new_salt).decode(),
+            'hash': base64.b64encode(new_key).decode()
+        }, f, indent=2)
+    QMessageBox.information(None, 'Успех', 'Мастер-пароль изменён.')
+
+# --- Работа с зашифрованной базой ---
+def decrypt_db(key: bytes):
+    if os.path.exists(ENCRYPTED_DB):
+        f    = Fernet(key)
+        data = f.decrypt(open(ENCRYPTED_DB,'rb').read())
+        open(PLAIN_DB,'wb').write(data)
+    else:
+        open(PLAIN_DB,'wb').close()
+
+def encrypt_db(key: bytes):
+    f    = Fernet(key)
+    data = open(PLAIN_DB,'rb').read()
+    open(ENCRYPTED_DB,'wb').write(f.encrypt(data))
+    os.remove(PLAIN_DB)
+
+# --- SQLAlchemy модель ---
 Base = declarative_base()
 class Entry(Base):
     __tablename__ = 'entries'
@@ -94,146 +124,117 @@ class Entry(Base):
     password = Column(String,  nullable=False)
     note     = Column(String)
 
-
-# --- Логика менеджера паролей ---
+# --- Менеджер паролей ---
 class PasswordManager:
     def __init__(self):
-        db_path = os.path.join(os.path.dirname(__file__), DB_FILE)
-        self.engine  = create_engine(f'sqlite:///{db_path}')
+        self.engine  = create_engine(f'sqlite:///{PLAIN_DB}')
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
 
-    def add_entry(self, service, login, password, note):
-        session = self.Session()
-        entry   = Entry(service=service, login=login,
-                        password=password, note=note)
-        session.add(entry)
-        session.commit()
-        session.close()
+    def add_entry(self, svc, lg, pwd, note):
+        s = self.Session()
+        e = Entry(service=svc, login=lg, password=pwd, note=note)
+        s.add(e); s.commit(); s.close()
 
     def get_entries(self):
-        session = self.Session()
-        items   = session.query(Entry).all()
-        session.close()
-        return items
+        s    = self.Session()
+        rows = s.query(Entry).all()
+        s.close()
+        return rows
 
-
-# --- Диалог добавления новой записи ---
+# --- Диалог добавления записи ---
 class AddDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Новая запись')
+        self.svc  = QLineEdit(); self.lg  = QLineEdit()
+        self.pw   = QLineEdit(); self.note = QLineEdit()
+        gen = QPushButton('Сгенерировать'); gen.clicked.connect(self.gen_pw)
+        save = QPushButton('Сохранить');     save.clicked.connect(self.accept)
 
-        self.service_input  = QLineEdit()
-        self.login_input    = QLineEdit()
-        self.password_input = QLineEdit()
-        self.note_input     = QLineEdit()
+        lay = QVBoxLayout()
+        lay.addWidget(QLabel('Сервис:'));   lay.addWidget(self.svc)
+        lay.addWidget(QLabel('Логин:'));     lay.addWidget(self.lg)
+        lay.addWidget(QLabel('Пароль:'))
+        row = QHBoxLayout(); row.addWidget(self.pw); row.addWidget(gen)
+        lay.addLayout(row)
+        lay.addWidget(QLabel('Примечание:')); lay.addWidget(self.note)
+        lay.addWidget(save); self.setLayout(lay)
 
-        gen_btn  = QPushButton('Сгенерировать пароль')
-        gen_btn.clicked.connect(self.generate_password)
-        save_btn = QPushButton('Сохранить')
-        save_btn.clicked.connect(self.accept)
-
-        layout = QVBoxLayout()
-        layout.addWidget(QLabel('Сервис:'))
-        layout.addWidget(self.service_input)
-        layout.addWidget(QLabel('Логин:'))
-        layout.addWidget(self.login_input)
-        layout.addWidget(QLabel('Пароль:'))
-        pw_row = QHBoxLayout()
-        pw_row.addWidget(self.password_input)
-        pw_row.addWidget(gen_btn)
-        layout.addLayout(pw_row)
-        layout.addWidget(QLabel('Примечание:'))
-        layout.addWidget(self.note_input)
-        layout.addWidget(save_btn)
-        self.setLayout(layout)
-
-    def generate_password(self):
-        length, ok = QInputDialog.getInt(
-            self, 'Длина пароля',
-            'Укажите длину пароля:', 16, 6, 64
-        )
-        if not ok:
-            return
-        # Генерация по логистической карте: x_{n+1}=r·x_n·(1−x_n)
-        import string
-        r     = 3.99
-        x     = time.time() % 1
-        chars = string.ascii_letters + string.digits + string.punctuation
-        pwd   = ''
+    def gen_pw(self):
+        length, ok = QInputDialog.getInt(self,'Длина','Укажите длину:',16,6,64)
+        if not ok: return
+        r = 3.99; x = time.time()%1
+        chars = string.ascii_letters+string.digits+string.punctuation
+        pwd = ''
         for _ in range(length):
-            x   = r * x * (1 - x)
-            idx = int(abs(x) * len(chars)) % len(chars)
+            x   = r*x*(1-x)
+            idx = int(abs(x)*len(chars))%len(chars)
             pwd += chars[idx]
-        self.password_input.setText(pwd)
+        self.pw.setText(pwd)
 
-
-# --- Главное окно приложения ---
+# --- Главное окно ---
 class MainWindow(QMainWindow):
-    def __init__(self, manager: PasswordManager):
+    def __init__(self, pm: PasswordManager, key: bytes):
         super().__init__()
-        self.manager = manager
-        self.setWindowTitle('Менеджер паролей v3')
+        self.pm  = pm; self.key = key
+        self.setWindowTitle('Менеджер паролей v4')
 
-        self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(
-            ['ID', 'Сервис', 'Логин', 'Пароль', 'Примечание']
-        )
-        self.load_entries()
+        # меню
+        men = QMenuBar(self); self.setMenuBar(men)
+        acc = men.addMenu('Аккаунт')
+        acc.addAction(QAction('Сменить мастер-пароль', self, triggered=lambda: change_master_password(self.key)))
 
-        add_btn = QPushButton('Добавить запись')
-        add_btn.clicked.connect(self.add_entry)
+        self.tbl = QTableWidget(0,5)
+        self.tbl.setHorizontalHeaderLabels(['ID','Сервис','Логин','Пароль','Примечание'])
+        btn = QPushButton('Добавить запись'); btn.clicked.connect(self.on_add)
 
-        container = QWidget()
-        vlay      = QVBoxLayout()
-        vlay.addWidget(self.table)
-        vlay.addWidget(add_btn)
-        container.setLayout(vlay)
-        self.setCentralWidget(container)
+        w = QWidget(); v = QVBoxLayout(w)
+        v.addWidget(self.tbl); v.addWidget(btn)
+        self.setCentralWidget(w)
+        self.load()
 
-    def load_entries(self):
-        rows = self.manager.get_entries()
-        self.table.setRowCount(len(rows))
-        for i, e in enumerate(rows):
-            self.table.setItem(i, 0, QTableWidgetItem(str(e.id)))
-            self.table.setItem(i, 1, QTableWidgetItem(e.service))
-            self.table.setItem(i, 2, QTableWidgetItem(e.login or ''))
-            self.table.setItem(i, 3, QTableWidgetItem(e.password))
-            self.table.setItem(i, 4, QTableWidgetItem(e.note or ''))
+    def load(self):
+        rows = self.pm.get_entries()
+        self.tbl.setRowCount(len(rows))
+        for i,e in enumerate(rows):
+            self.tbl.setItem(i,0,QTableWidgetItem(str(e.id)))
+            self.tbl.setItem(i,1,QTableWidgetItem(e.service))
+            self.tbl.setItem(i,2,QTableWidgetItem(e.login or ''))
+            self.tbl.setItem(i,3,QTableWidgetItem(e.password))
+            self.tbl.setItem(i,4,QTableWidgetItem(e.note or ''))
 
-    def add_entry(self):
+    def on_add(self):
         dlg = AddDialog()
         if dlg.exec():
-            svc  = dlg.service_input.text().strip()
-            pwd  = dlg.password_input.text().strip()
+            svc = dlg.svc.text().strip()
+            pwd = dlg.pw.text().strip()
             if not svc or not pwd:
-                QMessageBox.warning(self, 'Ошибка',
-                                    'Поля "Сервис" и "Пароль" обязательны')
+                QMessageBox.warning(self,'Ошибка','Сервис и пароль обязательны')
                 return
-            lg   = dlg.login_input.text().strip()
-            note = dlg.note_input.text().strip()
-            self.manager.add_entry(svc, lg, pwd, note)
-            self.load_entries()
-
+            self.pm.add_entry(svc, dlg.lg.text().strip(), pwd, dlg.note.text().strip())
+            self.load()
 
 # --- Точка входа ---
 def main():
     app = QApplication(sys.argv)
 
-    # 1) Инициализируем и проверяем мастер-пароль
+    # 1) Конфиг и проверка
     init_config()
-    check_master_password()
+    key = check_master_password()
 
-    # 2) Основное окно
-    manager = PasswordManager()
-    win     = MainWindow(manager)
-    win.resize(800, 450)
-    win.show()
+    # 2) Дешифруем базу
+    decrypt_db(key)
 
-    sys.exit(app.exec())
+    # 3) UI
+    pm = PasswordManager()
+    mw = MainWindow(pm, key)
+    mw.resize(800,450); mw.show()
+    ret = app.exec()
 
+    # 4) Шифруем перед выходом
+    encrypt_db(key)
+    sys.exit(ret)
 
 if __name__ == '__main__':
     main()

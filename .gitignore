@@ -1,0 +1,4 @@
+# не коммитим незашифрованную базу и test-файлы
+passwords.db
+passwords
+secret.key
