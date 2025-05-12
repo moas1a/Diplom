@@ -4,6 +4,7 @@
 1) Русский интерфейс
 2) Мастер-пароль (можно менять)
 3) Шифрование всей базы через Fernet
+4) Добавление и удаление записей
 Требования:
     pip install PySide6 SQLAlchemy cryptography
 """
@@ -136,6 +137,14 @@ class PasswordManager:
         e = Entry(service=svc, login=lg, password=pwd, note=note)
         s.add(e); s.commit(); s.close()
 
+    def delete_entry(self, entry_id: int):
+        s = self.Session()
+        entry = s.query(Entry).filter(Entry.id == entry_id).first()
+        if entry:
+            s.delete(entry)
+            s.commit()
+        s.close()
+
     def get_entries(self):
         s    = self.Session()
         rows = s.query(Entry).all()
@@ -177,32 +186,47 @@ class AddDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self, pm: PasswordManager, key: bytes):
         super().__init__()
-        self.pm  = pm; self.key = key
+        self.pm = pm
+        self.key = key
         self.setWindowTitle('Менеджер паролей v4')
 
         # меню
-        men = QMenuBar(self); self.setMenuBar(men)
+        men = QMenuBar(self)
+        self.setMenuBar(men)
         acc = men.addMenu('Аккаунт')
         acc.addAction(QAction('Сменить мастер-пароль', self, triggered=lambda: change_master_password(self.key)))
 
-        self.tbl = QTableWidget(0,5)
-        self.tbl.setHorizontalHeaderLabels(['ID','Сервис','Логин','Пароль','Примечание'])
-        btn = QPushButton('Добавить запись'); btn.clicked.connect(self.on_add)
+        # Таблица для отображения паролей
+        self.tbl = QTableWidget(0, 5)
+        self.tbl.setHorizontalHeaderLabels(['ID', 'Сервис', 'Логин', 'Пароль', 'Примечание'])
+        self.tbl.setSelectionMode(QTableWidget.SingleSelection)  # Выбор одного элемента
+        self.tbl.setSelectionBehavior(QTableWidget.SelectRows)  # Поведение выбора по строкам
 
-        w = QWidget(); v = QVBoxLayout(w)
-        v.addWidget(self.tbl); v.addWidget(btn)
+        # Кнопки
+        btn_add = QPushButton('Добавить запись')
+        btn_add.clicked.connect(self.on_add)
+        btn_del = QPushButton('Удалить запись')
+        btn_del.clicked.connect(self.on_delete)
+
+        # Лейаут
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.addWidget(self.tbl)
+        v.addWidget(btn_add)
+        v.addWidget(btn_del)
+
         self.setCentralWidget(w)
         self.load()
 
     def load(self):
         rows = self.pm.get_entries()
         self.tbl.setRowCount(len(rows))
-        for i,e in enumerate(rows):
-            self.tbl.setItem(i,0,QTableWidgetItem(str(e.id)))
-            self.tbl.setItem(i,1,QTableWidgetItem(e.service))
-            self.tbl.setItem(i,2,QTableWidgetItem(e.login or ''))
-            self.tbl.setItem(i,3,QTableWidgetItem(e.password))
-            self.tbl.setItem(i,4,QTableWidgetItem(e.note or ''))
+        for i, e in enumerate(rows):
+            self.tbl.setItem(i, 0, QTableWidgetItem(str(e.id)))
+            self.tbl.setItem(i, 1, QTableWidgetItem(e.service))
+            self.tbl.setItem(i, 2, QTableWidgetItem(e.login or ''))
+            self.tbl.setItem(i, 3, QTableWidgetItem(e.password))
+            self.tbl.setItem(i, 4, QTableWidgetItem(e.note or ''))
 
     def on_add(self):
         dlg = AddDialog()
@@ -210,9 +234,25 @@ class MainWindow(QMainWindow):
             svc = dlg.svc.text().strip()
             pwd = dlg.pw.text().strip()
             if not svc or not pwd:
-                QMessageBox.warning(self,'Ошибка','Сервис и пароль обязательны')
+                QMessageBox.warning(self, 'Ошибка', 'Сервис и пароль обязательны')
                 return
             self.pm.add_entry(svc, dlg.lg.text().strip(), pwd, dlg.note.text().strip())
+            self.load()
+
+    def on_delete(self):
+        row = self.tbl.currentRow()
+        if row == -1:
+            QMessageBox.warning(self, 'Ошибка', 'Выберите запись для удаления')
+            return
+
+        # Подтверждение удаления
+        entry_id = int(self.tbl.item(row, 0).text())
+        reply = QMessageBox.question(self, 'Подтверждение удаления',
+                                     f'Вы уверены, что хотите удалить запись {entry_id}?', 
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            self.pm.delete_entry(entry_id)
             self.load()
 
 # --- Точка входа ---
